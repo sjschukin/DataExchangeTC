@@ -1,0 +1,228 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Data;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Xml;
+using System.Xml.Serialization;
+using Devart.Data.Oracle;
+using NLog;
+using Schukin.DataExchangeTC.Properties;
+
+namespace Schukin.DataExchangeTC
+{
+    public class Program
+    {
+        private static IOutput _output;
+        private static readonly Logger _logger = LogManager.GetCurrentClassLogger();
+        private static string _inputFilename;
+        private static string _outputFilename;
+        private static string _dbname;
+        private static string _username;
+        private static string _password;
+        private static bool _isUnicode;
+
+        static void Main(string[] args)
+        {
+            _output = new ConsoleOutput();
+
+            if (args.Any(x => x == "/?"))
+            {
+                ShowHelp();
+                return;
+            }
+
+            _inputFilename = GetParameterValue(args, "/i");
+            _outputFilename = GetParameterValue(args, "/o");
+            _dbname = GetParameterValue(args, "/db");
+            _username = GetParameterValue(args, "/u");
+            _password = GetParameterValue(args, "/p");
+            _isUnicode = args.Contains("/unicode");
+
+            if (String.IsNullOrEmpty(_dbname))
+            {
+                _output.Write("ОШИБКА: не указано имя базы данных.");
+                _logger.Error("Заданы неверные параметры: не указано имя базы данных.");
+                return;
+            }
+
+            if (String.IsNullOrEmpty(_username))
+            {
+                _output.Write("ОШИБКА: не указан логин пользователя базы данных.");
+                _logger.Error("Заданы неверные параметры: не указан логин пользователя базы данных.");
+                return;
+            }
+
+            if (String.IsNullOrEmpty(_inputFilename))
+            {
+                _output.Write("ОШИБКА: не указан путь к источнику.");
+                _logger.Error("Заданы неверные параметры: не указан путь к источнику.");
+                return;
+            }
+
+            DoWork();
+        }
+
+        public static void ShowHelp()
+        {
+            var assemblyName = Assembly.GetExecutingAssembly().GetName();
+            var appName = assemblyName.Name;
+            var version = assemblyName.Version;
+
+            var lines = new[]
+            {
+                $"{appName}, версия {version}",
+                "Формирование сведений о льготных получателях на основе запроса из администрации г.Рязани для организации выдачи транспортных карт",
+                "(см. описание формата файлов в Соглашении)",
+                "(c) Министерство социальной защиты населения Рязанской области",
+                "",
+                "ИСПОЛЬЗОВАНИЕ:",
+                "",
+                "  DataExchangeTC.exe /db {db_name} /u {username} [/p {password}] /i {filename} [/o {filename}] [/unicode]",
+                "",
+                "ПАРАМЕТРЫ:",
+                "  /? - отображает эту справку;",
+                "  /db {db_name} - указывает имя базы данных, для сверки и выгрузки;",
+                "  /u {username} - указывает логин для входа пользователя базы данных;",
+                "  /p {password} - указывает пароль для входа пользователя базы данных;",
+                "  /i {filename} - указывает путь к файлу запроса (формат 1.0);",
+                "  /o {filename} - указывает путь к файлу (или каталогу) в который будет формироваться ответ;",
+                "  /unicode      - включает поддержку Unicode на стороне клиента."
+            };
+
+            _output.Write(lines);
+        }
+
+        public static void DoWork()
+        {
+            try
+            {
+                _output.Write("Начало обработки...");
+                _logger.Info("Начало обработки...");
+
+                var serializerRequest = new XmlSerializer(typeof(Request));
+                Request request;
+
+                using (var reader = XmlReader.Create(_inputFilename))
+                {
+                    request = (Request)serializerRequest.Deserialize(reader);
+                }
+
+                if (String.IsNullOrEmpty(_outputFilename))
+                {
+                    _outputFilename = request.RequestDate.ToString("yyyyMMdd") + "_answer.xml";
+                }
+
+                using (var connection = new OracleConnection($"Server={_dbname};User Id={_username};Password={_password};Unicode={_isUnicode}"))
+                {
+                    connection.Open();
+
+                    var answerData = new List<AnswerAnswerData>();
+
+                    foreach (var requestData in request.RequestData)
+                    {
+                        var person = requestData.Person;
+
+                        var command = new OracleCommand("LGOTNVIEW.GetDataRow", connection)
+                        {
+                            CommandType = CommandType.StoredProcedure,
+                            Parameters =
+                            {
+                                {"in_Snils", person.Snils},
+                                {"in_LastName", person.LastName},
+                                {"in_FirstName", person.FirstName},
+                                {"in_SecondName", person.SecondName},
+                                {"in_BirthDate", person.BirthDate}
+                            }
+                        };
+
+                        var reader = command.ExecuteReader();
+
+                        if (reader.Read())
+                        {
+                            var personAnswer = new AnswerAnswerDataPerson
+                            {
+                                Snils = person.Snils,
+                                LastName = person.LastName,
+                                FirstName = person.FirstName,
+                                SecondName = person.SecondName,
+                                BirthDate = person.BirthDate,
+                                PreferentialCategory = new AnswerAnswerDataPersonPreferentialCategory
+                                {
+                                    Id = reader.GetString(5),
+                                    Name = reader.GetString(6)
+                                }
+                            };
+
+                            if (reader.IsDBNull(7))
+                            {
+                                personAnswer.PreferentialCategory.DateToSpecified = false;
+                            }
+                            else
+                            {
+                                personAnswer.PreferentialCategory.DateToSpecified = true;
+                                personAnswer.PreferentialCategory.DateTo = reader.GetDateTime(7);
+                            }
+
+                            answerData.Add(new AnswerAnswerData {Person = personAnswer});
+                        }
+                        reader.Close();
+                    }
+
+                    connection.Close();
+
+                    var serializerAnswer = new XmlSerializer(typeof(Answer));
+                    var answer = new Answer
+                    {
+                        Version = 1.0M,
+                        RequestDate = request.RequestDate,
+                        AnswerDate = DateTime.Today,
+                        Sender = new AnswerSender
+                        {
+                            Id = Settings.Default.SenderId,
+                            Name = Settings.Default.SenderName
+                        },
+                        Recipient = new AnswerRecipient
+                        {
+                            Id = request.Sender.Id,
+                            Name = request.Sender.Name
+                        },
+                        AnswerData = answerData.ToArray()
+                    };
+
+                    using (var writer = XmlWriter.Create(_outputFilename))
+                    {
+                        serializerAnswer.Serialize(writer, answer);
+                    }
+                }
+
+                _output.Write("Выполнено.");
+                _logger.Info("Выполнено");
+            }
+            catch (OracleException ex)
+            {
+                _output.Write($"Ошибка базы данных: {ex.Message}");
+                _logger.Error("Ошибка базы данных: {0}", ex);
+            }
+            catch (Exception ex)
+            {
+                _output.Write($"Ошибка: {ex.Message}");
+                _logger.Error(ex);
+            }
+        }
+
+        private static string GetParameterValue(string[] args, string paramName)
+        {
+            if (args.All(x => x != paramName)) return null;
+
+            string value = null;
+            var index = Array.FindIndex(args, x => x == paramName);
+
+            if (args.Length > index + 1)
+                value = args[index + 1];
+
+            return value;
+        }
+    }
+}
